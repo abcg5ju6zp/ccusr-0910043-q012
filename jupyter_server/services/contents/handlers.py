@@ -16,6 +16,7 @@ from tornado import web
 
 from jupyter_server.auth.decorator import allow_unauthenticated, authorized
 from jupyter_server.base.handlers import APIHandler, JupyterHandler, path_regex
+from jupyter_server.services.contents.trust import _parse_dt
 from jupyter_server.utils import url_escape, url_path_join
 
 AUTH_RESOURCE = "contents"
@@ -385,6 +386,67 @@ class TrustNotebooksHandler(JupyterHandler):
         self.finish()
 
 
+def _parse_datetime_argument(value, name):
+    """项目内部接口说明。"""
+    try:
+        return _parse_dt(value)
+    except (TypeError, ValueError):
+        raise web.HTTPError(400, f"Invalid {name}: {value!r} (expected ISO 8601)") from None
+
+
+class TrustStatusHandler(ContentsAPIHandler):
+    """项目内部接口说明。"""
+
+    @web.authenticated
+    @authorized
+    def get(self):
+        """项目内部接口说明。"""
+        notary = self.contents_manager.notary
+        trust_status = getattr(notary, "trust_status", None)
+        if trust_status is None:
+            raise web.HTTPError(
+                501, "Configured notary does not support generational trust management"
+            )
+        self.finish(json.dumps(trust_status(), default=json_default))
+
+
+class TrustRotateHandler(ContentsAPIHandler):
+    """项目内部接口说明。"""
+
+    @web.authenticated
+    @authorized
+    def post(self):
+        """项目内部接口说明。"""
+        notary = self.contents_manager.notary
+        rotate_key = getattr(notary, "rotate_key", None)
+        if rotate_key is None:
+            raise web.HTTPError(
+                501, "Configured notary does not support generational trust management"
+            )
+        body = self.get_json_body() or {}
+        verify_old_until = body.get("verify_old_until")
+        revoke_before = body.get("revoke_before")
+        reason = body.get("reason", "")
+        if not isinstance(reason, str):
+            raise web.HTTPError(400, "Invalid reason: expected a string")
+        new_generation = rotate_key(
+            verify_old_until=_parse_datetime_argument(verify_old_until, "verify_old_until")
+            if verify_old_until is not None
+            else None,
+            revoke_before=_parse_datetime_argument(revoke_before, "revoke_before")
+            if revoke_before is not None
+            else None,
+            reason=reason,
+        )
+        self.log.warning(
+            "Rotated notebook signing key to generation %d (reason: %s)",
+            new_generation,
+            reason or "none given",
+        )
+        self.set_status(201)
+        self.finish(json.dumps(notary.trust_status(), default=json_default))
+
+
 # -----------------------------------------------------------------------------
 # URL to handler mappings
 # -----------------------------------------------------------------------------
@@ -400,6 +462,8 @@ default_handlers = [
         ModifyCheckpointsHandler,
     ),
     (r"/api/contents%s/trust" % path_regex, TrustNotebooksHandler),
+    (r"/api/trust/status", TrustStatusHandler),
+    (r"/api/trust/rotate", TrustRotateHandler),
     (r"/api/contents%s" % path_regex, ContentsHandler),
     (r"/api/notebooks/?(.*)", NotebooksRedirectHandler),
 ]

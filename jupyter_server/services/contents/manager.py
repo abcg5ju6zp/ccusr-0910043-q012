@@ -38,6 +38,7 @@ from jupyter_server.utils import import_item
 
 from ...files.handlers import FilesHandler
 from .checkpoints import AsyncCheckpoints, Checkpoints
+from .trust import BLOCKED_INHERIT_REASONS, GenerationalNotebookNotary
 
 copy_pat = re.compile(r"\-Copy\d*\.")
 
@@ -101,7 +102,7 @@ class ContentsManager(LoggingConfigurable):
 
     @default("notary")
     def _notary_default(self):
-        return sign.NotebookNotary(parent=self)
+        return GenerationalNotebookNotary(parent=self)
 
     hide_globs = List(
         Unicode(),
@@ -563,12 +564,16 @@ class ContentsManager(LoggingConfigurable):
         nb = model["content"]
         self.log.warning("Trusting notebook %s", path)
         self.notary.mark_cells(nb, True)
-        self.check_and_sign(nb, path)
+        self.check_and_sign(nb, path, force=True)
 
-    def check_and_sign(self, nb, path="", *, _retrying=False):
+    def check_and_sign(self, nb, path="", *, force=False, _retrying=False):
         """项目内部接口说明。"""
         try:
             if self.notary.check_cells(nb):
+                if not force and self._signing_blocked_by_trust_policy(nb, path):
+                    # 信任继承被轮换策略阻断（如记录已撤销、验证窗口已关闭）：
+                    # 不自动重签，避免把已撤销的签名恢复为可信。
+                    return
                 self.notary.sign(nb)
             else:
                 self.log.warning("Notebook %s is not trusted", path)
@@ -586,14 +591,76 @@ class ContentsManager(LoggingConfigurable):
             # attempt to recreate the database if it detects errors during initialization,
             # and fallback to in-memory (`:memory:`) SQLite database if necessary.
             self.notary.store = self.notary.store_factory()
-            self.check_and_sign(nb, path, _retrying=True)
+            self.check_and_sign(nb, path, force=force, _retrying=True)
+
+    def _signing_blocked_by_trust_policy(self, nb, path=""):
+        """保存/另存/复制时重新判断信任继承：是否应阻止自动签名。
+
+        内容命中已撤销记录、验证窗口已关闭等策略原因时返回 True；
+        显式的 trust_notebook（force=True）不受此限制。
+        """
+        evaluate = getattr(self.notary, "evaluate_trust", None)
+        if evaluate is None:
+            return False
+        decision = evaluate(nb)
+        if decision.trusted or decision.reason not in BLOCKED_INHERIT_REASONS:
+            return False
+        self.log.warning(
+            "Not signing notebook %s: trust inheritance blocked (%s)",
+            path,
+            decision.reason,
+        )
+        return True
 
     def mark_trusted_cells(self, nb, path=""):
         """项目内部接口说明。"""
-        trusted = self.notary.check_signature(nb)
-        if not trusted:
-            self.log.warning("Notebook %s is not trusted", path)
+        evaluate = getattr(self.notary, "evaluate_trust", None)
+        if evaluate is not None:
+            decision = evaluate(nb)
+            trusted = decision.trusted
+            if not trusted:
+                self.log.warning("Notebook %s is not trusted: %s", path, decision.reason)
+        else:
+            trusted = self.notary.check_signature(nb)
+            if not trusted:
+                self.log.warning("Notebook %s is not trusted", path)
         self.notary.mark_cells(nb, trusted)
+
+    def reevaluate_trust_after_restore(self, checkpoint_id, path):
+        """恢复检查点后重新判断信任继承（只记录判定，不修改文件）。
+
+        恢复出的内容随后会在 get/save 路径上再次经过
+        mark_trusted_cells / check_and_sign 的完整判定。
+        """
+        read_notebook = getattr(self, "_read_notebook", None)
+        get_os_path = getattr(self, "_get_os_path", None)
+        if read_notebook is None or get_os_path is None or not path.endswith(".ipynb"):
+            return
+        try:
+            nb = read_notebook(get_os_path(path), as_version=4)
+            self._log_trust_reevaluation(nb, checkpoint_id, path)
+        except Exception:
+            self.log.warning(
+                "Could not re-evaluate trust of %s after checkpoint restore",
+                path,
+                exc_info=True,
+            )
+
+    def _log_trust_reevaluation(self, nb, checkpoint_id, path):
+        """记录一次恢复后的信任继承判定结果。"""
+        evaluate = getattr(self.notary, "evaluate_trust", None)
+        if evaluate is None:
+            return
+        decision = evaluate(nb)
+        if decision.trusted:
+            self.log.info("Restored checkpoint %s for %s inherits trust", checkpoint_id, path)
+        else:
+            self.log.warning(
+                "Restored checkpoint %s for %s does not inherit trust: %s",
+                checkpoint_id,
+                path,
+                decision.reason,
+            )
 
     def should_list(self, name):
         """项目内部接口说明。"""
@@ -607,6 +674,7 @@ class ContentsManager(LoggingConfigurable):
     def restore_checkpoint(self, checkpoint_id, path):
         """项目内部接口说明。"""
         self.checkpoints.restore_checkpoint(self, checkpoint_id, path)
+        self.reevaluate_trust_after_restore(checkpoint_id, path)
 
     def list_checkpoints(self, path):
         return self.checkpoints.list_checkpoints(path)
@@ -820,7 +888,7 @@ class AsyncContentsManager(ContentsManager):
         nb = model["content"]
         self.log.warning("Trusting notebook %s", path)
         self.notary.mark_cells(nb, True)
-        self.check_and_sign(nb, path)
+        self.check_and_sign(nb, path, force=True)
 
     # Part 3: Checkpoints API
     async def create_checkpoint(self, path):
@@ -830,6 +898,23 @@ class AsyncContentsManager(ContentsManager):
     async def restore_checkpoint(self, checkpoint_id, path):
         """项目内部接口说明。"""
         await self.checkpoints.restore_checkpoint(self, checkpoint_id, path)
+        await self.reevaluate_trust_after_restore(checkpoint_id, path)
+
+    async def reevaluate_trust_after_restore(self, checkpoint_id, path):
+        """恢复检查点后重新判断信任继承（异步版本）。"""
+        read_notebook = getattr(self, "_read_notebook", None)
+        get_os_path = getattr(self, "_get_os_path", None)
+        if read_notebook is None or get_os_path is None or not path.endswith(".ipynb"):
+            return
+        try:
+            nb = await read_notebook(get_os_path(path), as_version=4)
+            self._log_trust_reevaluation(nb, checkpoint_id, path)
+        except Exception:
+            self.log.warning(
+                "Could not re-evaluate trust of %s after checkpoint restore",
+                path,
+                exc_info=True,
+            )
 
     async def list_checkpoints(self, path):
         """项目内部接口说明。"""
