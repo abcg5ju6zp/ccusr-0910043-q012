@@ -38,6 +38,7 @@ from jupyter_server.utils import import_item
 
 from ...files.handlers import FilesHandler
 from .checkpoints import AsyncCheckpoints, Checkpoints
+from .trust import TrustManager, TrustVerdict
 
 copy_pat = re.compile(r"\-Copy\d*\.")
 
@@ -102,6 +103,12 @@ class ContentsManager(LoggingConfigurable):
     @default("notary")
     def _notary_default(self):
         return sign.NotebookNotary(parent=self)
+
+    trust_manager = Instance(TrustManager)
+
+    @default("trust_manager")
+    def _trust_manager_default(self):
+        return TrustManager(parent=self)
 
     hide_globs = List(
         Unicode(),
@@ -551,6 +558,10 @@ class ContentsManager(LoggingConfigurable):
 
         model = self.save(model, to_path)
         self.emit(data={"action": "copy", "path": to_path, "source_path": from_path})
+        # 跨目录复制后重新判断信任继承
+        to_dir = to_path.rsplit("/", 1)[0] if "/" in to_path else ""
+        event = "cross-directory-copy" if to_dir != from_dir else "copy"
+        self._reevaluate_trust_quietly(to_path, event)
         return model
 
     def log_info(self):
@@ -568,7 +579,8 @@ class ContentsManager(LoggingConfigurable):
     def check_and_sign(self, nb, path="", *, _retrying=False):
         """项目内部接口说明。"""
         try:
-            if self.notary.check_cells(nb):
+            cells_trusted = bool(self.notary.check_cells(nb))
+            if cells_trusted:
                 self.notary.sign(nb)
             else:
                 self.log.warning("Notebook %s is not trusted", path)
@@ -587,13 +599,89 @@ class ContentsManager(LoggingConfigurable):
             # and fallback to in-memory (`:memory:`) SQLite database if necessary.
             self.notary.store = self.notary.store_factory()
             self.check_and_sign(nb, path, _retrying=True)
+            return
+        if cells_trusted:
+            self._record_trust_signature(nb, path)
+        self._track_trust_path_state(nb, path)
+
+    def _track_trust_path_state(self, nb, path=""):
+        """保存后记录路径的内容状态，避免把自身写入误判为外部修改。"""
+        try:
+            self.trust_manager.track_path_state(nb, path)
+        except Exception:
+            self.log.error("Trust path-state tracking failed for %s", path, exc_info=True)
+
+    def _record_trust_signature(self, nb, path=""):
+        """用当前密钥代际记录扩展签名；已撤销的内容拒绝重签并保持不可信。"""
+        try:
+            record = self.trust_manager.sign_notebook(nb, path)
+        except Exception:
+            self.log.error(
+                "Trust signature store is unavailable; cannot record signature for %s",
+                path,
+                exc_info=True,
+            )
+            return
+        if record is None:
+            # 已经撤销的签名不得恢复为可信
+            self.notary.mark_cells(nb, False)
+            self.log.warning(
+                "Notebook %s matches a revoked signature; refusing to re-sign it",
+                path,
+            )
 
     def mark_trusted_cells(self, nb, path=""):
         """项目内部接口说明。"""
         trusted = self.notary.check_signature(nb)
+        verdict = self._verify_trust(nb, path, event="read")
+        if verdict is None or not verdict.trusted:
+            # 扩展信任验证失败或判定不可信时，一律按不可信处理
+            trusted = False
         if not trusted:
             self.log.warning("Notebook %s is not trusted", path)
         self.notary.mark_cells(nb, trusted)
+
+    def _verify_trust(self, nb, path="", event="read"):
+        """按扩展信任策略验证笔记本；验证失败时按不可信处理（fail closed）。"""
+        try:
+            return self.trust_manager.verify_notebook(nb, path, event=event)
+        except Exception:
+            self.log.error(
+                "Trust verification failed for %s; treating the notebook as untrusted",
+                path,
+                exc_info=True,
+            )
+            return None
+
+    def reevaluate_trust(self, path, event="read"):
+        """在另存、恢复检查点、外部修改、跨目录复制之后重新判断信任继承。
+
+        返回 TrustVerdict；非笔记本路径返回 None。验证过程只读取内容，
+        不会执行笔记本的代码或输出。
+        """
+        if not path.strip("/").endswith(".ipynb"):
+            return None
+        model = self.get(path)
+        nb = model["content"]
+        verdict = self._verify_trust(nb, path, event=event)
+        if verdict is None:
+            return TrustVerdict(
+                state="unknown",
+                trusted=False,
+                reason="trust verification unavailable",
+                event=event,
+            )
+        if not verdict.trusted:
+            self.notary.mark_cells(nb, False)
+        return verdict
+
+    def _reevaluate_trust_quietly(self, path, event):
+        """信任继承重判的容错包装：重判本身的异常不打断已完成的文件操作。"""
+        try:
+            return self.reevaluate_trust(path, event=event)
+        except Exception:
+            self.log.error("Trust re-evaluation failed for %s (%s)", path, event, exc_info=True)
+            return None
 
     def should_list(self, name):
         """项目内部接口说明。"""
@@ -607,6 +695,8 @@ class ContentsManager(LoggingConfigurable):
     def restore_checkpoint(self, checkpoint_id, path):
         """项目内部接口说明。"""
         self.checkpoints.restore_checkpoint(self, checkpoint_id, path)
+        # 恢复检查点后重新判断信任继承：已撤销的签名不得借此恢复为可信
+        self._reevaluate_trust_quietly(path, "checkpoint-restore")
 
     def list_checkpoints(self, path):
         return self.checkpoints.list_checkpoints(path)
@@ -812,7 +902,41 @@ class AsyncContentsManager(ContentsManager):
 
         model = await self.save(model, to_path)
         self.emit(data={"action": "copy", "path": to_path, "source_path": from_path})
+        # 跨目录复制后重新判断信任继承
+        to_dir = to_path.rsplit("/", 1)[0] if "/" in to_path else ""
+        event = "cross-directory-copy" if to_dir != from_dir else "copy"
+        await self._reevaluate_trust_quietly(to_path, event)
         return model
+
+    async def reevaluate_trust(self, path, event="read"):
+        """在另存、恢复检查点、外部修改、跨目录复制之后重新判断信任继承。
+
+        返回 TrustVerdict；非笔记本路径返回 None。验证过程只读取内容，
+        不会执行笔记本的代码或输出。
+        """
+        if not path.strip("/").endswith(".ipynb"):
+            return None
+        model = await self.get(path)
+        nb = model["content"]
+        verdict = self._verify_trust(nb, path, event=event)
+        if verdict is None:
+            return TrustVerdict(
+                state="unknown",
+                trusted=False,
+                reason="trust verification unavailable",
+                event=event,
+            )
+        if not verdict.trusted:
+            self.notary.mark_cells(nb, False)
+        return verdict
+
+    async def _reevaluate_trust_quietly(self, path, event):
+        """信任继承重判的容错包装：重判本身的异常不打断已完成的文件操作。"""
+        try:
+            return await self.reevaluate_trust(path, event=event)
+        except Exception:
+            self.log.error("Trust re-evaluation failed for %s (%s)", path, event, exc_info=True)
+            return None
 
     async def trust_notebook(self, path):
         """项目内部接口说明。"""
@@ -830,6 +954,8 @@ class AsyncContentsManager(ContentsManager):
     async def restore_checkpoint(self, checkpoint_id, path):
         """项目内部接口说明。"""
         await self.checkpoints.restore_checkpoint(self, checkpoint_id, path)
+        # 恢复检查点后重新判断信任继承：已撤销的签名不得借此恢复为可信
+        await self._reevaluate_trust_quietly(path, "checkpoint-restore")
 
     async def list_checkpoints(self, path):
         """项目内部接口说明。"""

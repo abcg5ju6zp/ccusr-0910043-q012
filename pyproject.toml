@@ -177,6 +177,7 @@ testpaths = [
     "tests/extension",
     "tests/services/contents/test_manager.py",
     "tests/services/contents/test_checkpoints.py",
+    "tests/services/contents/test_trust.py",
     "tests/services/sessions/test_manager.py",
 ]
 timeout = 100
